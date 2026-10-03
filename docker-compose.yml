@@ -1,0 +1,80 @@
+# Development stack: Postgres, the API, and the web app.
+#
+# `docker compose up` should be the only command a new contributor needs. Any
+# setup step that lives only in someone's shell history is a step that will be
+# wrong by the time the next person runs it.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ticketing
+      POSTGRES_PASSWORD: ticketing
+      POSTGRES_DB: ticketing
+    ports:
+      # Overridable, because a developer machine very often already has a
+      # Postgres on 5432 and a hard-coded mapping turns `docker compose up`
+      # into a port conflict on first run. Set POSTGRES_PORT to move it; the
+      # API reaches the database over the compose network either way, so only
+      # local tooling (psql, `make api`) is affected.
+      - '${POSTGRES_PORT:-5432}:5432'
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      # The API waits on this rather than on the container merely existing.
+      # Postgres accepts connections several seconds after the process starts,
+      # and "depends_on" without a health check races that window every time.
+      test: ['CMD-SHELL', 'pg_isready -U ticketing -d ticketing']
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  api:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    environment:
+      ENV: development
+      PORT: '8080'
+      DATABASE_URL: postgres://ticketing:ticketing@postgres:5432/ticketing?sslmode=disable
+      # Development only. The API refuses to start in production with a secret
+      # shorter than 32 characters, and refuses sslmode=disable outright.
+      JWT_SECRET: development-only-secret-not-for-production-use
+      CORS_ORIGINS: http://localhost:5173
+      LOG_LEVEL: info
+      LOG_FORMAT: text
+      SLA_SWEEP_INTERVAL: 30s
+      PUBLIC_BASE_URL: http://localhost:5173
+    ports:
+      - '8080:8080'
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ['CMD', '/app/api', '-healthcheck']
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+
+  web:
+    build:
+      context: ./web
+      dockerfile: Dockerfile
+      target: development
+    environment:
+      VITE_API_TARGET: http://api:8080
+    ports:
+      - '5173:5173'
+    volumes:
+      # Bind-mounted source for hot reload, with an anonymous volume masking
+      # node_modules so the container's Linux binaries are not overwritten by
+      # the host's (which may be a different platform entirely).
+      - ./web/src:/app/src
+      - ./web/index.html:/app/index.html
+      - /app/node_modules
+    depends_on:
+      - api
+
+volumes:
+  postgres-data:
