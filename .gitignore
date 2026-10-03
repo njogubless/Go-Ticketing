@@ -1,0 +1,29 @@
+# Secrets. .env is ignored and .env.example is committed — the example
+# documents which variables exist without any of them being real.
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+
+# Build output
+/backend/bin/
+/backend/coverage.out
+/web/dist/
+/web/node_modules/
+/web/.vite/
+node_modules/
+
+# Editors and OS
+.DS_Store
+Thumbs.db
+.idea/
+*.swp
+*~
+.vscode/*
+!.vscode/extensions.json
+
+# Logs and scratch
+*.log
+/tmp/
+.legacy-scaffold/
