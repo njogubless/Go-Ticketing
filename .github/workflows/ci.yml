@@ -1,0 +1,121 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# A newer push supersedes an in-flight run on the same branch. Without this,
+# a busy branch queues runs nobody will read.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend:
+    name: Backend
+    runs-on: ubuntu-latest
+
+    # A real Postgres rather than a mock. The riskiest code in this service is
+    # SQL — tenant scoping, the breach predicate, the reporting aggregates — and
+    # a mocked database tests the mock.
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: ticketing
+          POSTGRES_PASSWORD: ticketing
+          POSTGRES_DB: ticketing
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U ticketing"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      DATABASE_URL: postgres://ticketing:ticketing@localhost:5432/ticketing?sslmode=disable
+      JWT_SECRET: ci-only-secret-that-is-long-enough-for-validation
+      ENV: test
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+          cache-dependency-path: backend/go.sum
+
+      - name: Verify go.mod is tidy
+        working-directory: backend
+        run: |
+          go mod tidy
+          # A drifting go.mod is how a dependency ends up in a build without
+          # anyone reviewing it.
+          git diff --exit-code go.mod go.sum
+
+      - name: Vet
+        working-directory: backend
+        run: go vet ./...
+
+      - name: Test with the race detector
+        working-directory: backend
+        # The event bus, the WebSocket hub and the SLA worker are all concurrent.
+        # Data races there are exactly the kind of bug that passes locally and
+        # fails in production under load.
+        run: go test ./... -race -count=1
+
+      - name: Build
+        working-directory: backend
+        run: go build ./...
+
+      - name: Smoke test the running API
+        working-directory: backend
+        run: |
+          go run ./cmd/seed --tickets 40 &
+          SEED=$!
+          wait $SEED
+          go build -o /tmp/api ./cmd/api
+          PORT=18080 AUTH_RATE_LIMIT_PER_MINUTE=2000 RATE_LIMIT_PER_MINUTE=6000 /tmp/api &
+          for _ in $(seq 1 30); do
+            curl -sf localhost:18080/healthz >/dev/null && break
+            sleep 1
+          done
+          curl -sf localhost:18080/readyz
+
+  frontend:
+    name: Frontend
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install
+        working-directory: web
+        run: npm ci --no-audit --no-fund
+
+      - name: Typecheck
+        working-directory: web
+        run: npm run typecheck
+
+      - name: Build
+        working-directory: web
+        run: npm run build
+
+  images:
+    name: Container images
+    runs-on: ubuntu-latest
+    # Only after both suites pass — building images for a broken commit wastes
+    # several minutes per run and tells nobody anything.
+    needs: [backend, frontend]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the API image
+        run: docker build -t ticketing-api ./backend
+      - name: Build the web image
+        run: docker build --target production -t ticketing-web ./web
