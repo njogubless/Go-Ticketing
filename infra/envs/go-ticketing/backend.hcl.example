@@ -1,0 +1,11 @@
+# Copy to backend.hcl (gitignored) and run:
+#   terraform init -backend-config=backend.hcl
+#
+# The bucket is created by hand once per account — see docs/infra/README.md,
+# "One-time AWS setup".
+
+bucket       = "REPLACE-with-your-state-bucket"
+key          = "go-ticketing/sandbox.tfstate"
+region       = "REPLACE-with-bucket-region"
+encrypt      = true
+use_lockfile = true # S3-native locking (Terraform >= 1.10); no DynamoDB table
