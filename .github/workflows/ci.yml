@@ -4,12 +4,32 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Deploys are manual. Running this workflow by hand re-runs the full test
+  # suite and image build first; the deploy jobs at the bottom only run when
+  # `deploy` is ticked AND the repository variable DEPLOY_ENABLED is "true".
+  # See docs/infra/README.md, "Enabling deploys".
+  workflow_dispatch:
+    inputs:
+      deploy:
+        description: Deploy to the sandbox environment after tests pass
+        type: boolean
+        default: false
+      image_tag:
+        description: >-
+          Optional. Deploy this EXISTING image tag (a past commit SHA) instead of
+          building the current commit. Used to re-pin Terraform after a rollback.
+        type: string
+        default: ''
 
 # A newer push supersedes an in-flight run on the same branch. Without this,
 # a busy branch queues runs nobody will read.
+#
+# Manual runs get their own group and are never cancelled: a push to main must
+# not kill a deploy halfway through `terraform apply`, which would leave the
+# state lock held and the infrastructure half-changed.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' }}
 
 jobs:
   backend:
@@ -119,3 +139,246 @@ jobs:
         run: docker build -t ticketing-api ./backend
       - name: Build the web image
         run: docker build --target production -t ticketing-web ./web
+
+      # On a deploy run, hand the exact API image that just passed CI to the
+      # deploy job, rather than rebuilding it there. What ships is what was
+      # tested, byte for byte.
+      - name: Save the API image for deployment
+        if: github.event_name == 'workflow_dispatch' && inputs.deploy && inputs.image_tag == ''
+        run: docker save ticketing-api | gzip > ticketing-api.tar.gz
+      - uses: actions/upload-artifact@v4
+        if: github.event_name == 'workflow_dispatch' && inputs.deploy && inputs.image_tag == ''
+        with:
+          name: ticketing-api-image
+          path: ticketing-api.tar.gz
+          retention-days: 1
+
+  # ---------------------------------------------------------------------------
+  # Infrastructure checks — on every PR or push that touches infra/. No AWS
+  # credentials: fake ones are set inside plan-offline.sh, and the provider is
+  # told not to validate them. This proves formatting, variable wiring, the
+  # resource graph, the deployment-safety invariants (check-plan.sh) and the
+  # rollback logic (test/run.sh). It cannot prove AWS will accept the plan.
+  # ---------------------------------------------------------------------------
+  changes:
+    name: Detect infra changes
+    runs-on: ubuntu-latest
+    outputs:
+      infra: ${{ steps.filter.outputs.infra }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3.0.2
+        id: filter
+        with:
+          filters: |
+            infra:
+              - 'infra/**'
+              - '.github/workflows/ci.yml'
+
+  infra:
+    name: Infrastructure (validate · plan · rollback tests)
+    runs-on: ubuntu-latest
+    needs: [changes]
+    if: needs.changes.outputs.infra == 'true'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.17.2
+          # The wrapper rewrites stdout, which breaks `terraform show -json`
+          # piped into jq.
+          terraform_wrapper: false
+
+      - name: Lint shell scripts
+        # shellcheck is preinstalled on GitHub's Ubuntu runners.
+        run: shellcheck infra/scripts/*.sh infra/scripts/test/run.sh infra/scripts/test/fake-aws
+
+      - name: fmt · validate · plan (no credentials) · plan invariants
+        run: make infra-plan
+
+      - name: Rollback and deploy-verification script tests
+        run: make infra-test
+
+  # ---------------------------------------------------------------------------
+  # Deploy — DISABLED until AWS is wired up.
+  #
+  # Both jobs below are skipped unless ALL of these hold:
+  #   * the run was started by hand (workflow_dispatch) with `deploy` ticked,
+  #   * it runs on main,
+  #   * the repository variable DEPLOY_ENABLED is "true" (unset today).
+  #
+  # Turning them on is a settings change, not a code change — see
+  # docs/infra/README.md, "Enabling deploys". Credentials come from GitHub OIDC
+  # (vars.AWS_DEPLOY_ROLE_ARN); there are no long-lived AWS keys anywhere.
+  #
+  # Two jobs, so a human approves a plan they have actually seen:
+  #   deploy-plan   pushes the image, runs `terraform plan`, publishes it to the
+  #                 job summary, and records a digest of it.
+  #   deploy-apply  waits on the `sandbox` environment's required reviewers,
+  #                 re-plans, REFUSES if the plan differs from the reviewed one,
+  #                 applies, then verifies the new revision rolled out.
+  #
+  # The plan file itself is not passed between jobs as an artifact: it contains
+  # secret values (the generated passwords) in plain text, and artifacts are
+  # downloadable by anyone with read access to the repository.
+  # ---------------------------------------------------------------------------
+  deploy-plan:
+    name: Deploy · plan
+    runs-on: ubuntu-latest
+    needs: [images]
+    if: >-
+      github.event_name == 'workflow_dispatch' && inputs.deploy &&
+      github.ref == 'refs/heads/main' && vars.DEPLOY_ENABLED == 'true'
+    permissions:
+      contents: read
+      id-token: write # GitHub OIDC → AWS STS
+    env:
+      TF_IN_AUTOMATION: '1'
+      TF_DIR: infra/envs/go-ticketing
+      # A past SHA when re-pinning after a rollback; otherwise this commit.
+      IMAGE_TAG: ${{ inputs.image_tag != '' && inputs.image_tag || github.sha }}
+    outputs:
+      image_tag: ${{ env.IMAGE_TAG }}
+      plan_digest: ${{ steps.plan.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - uses: aws-actions/amazon-ecr-login@v2
+        id: ecr
+
+      - uses: actions/download-artifact@v4
+        if: inputs.image_tag == ''
+        with:
+          name: ticketing-api-image
+
+      - name: Push the tested image to ECR
+        env:
+          REPO: go-ticketing-${{ vars.ENVIRONMENT || 'sandbox' }}
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+        run: |
+          # Tags are immutable in ECR. If this tag is already there (a re-run,
+          # or a re-pin to an older SHA), the image is by definition the same
+          # bits, so skip the push instead of failing on it.
+          if aws ecr describe-images --repository-name "$REPO" --image-ids "imageTag=$IMAGE_TAG" >/dev/null 2>&1; then
+            echo "$REPO:$IMAGE_TAG already in ECR — not pushing"
+            exit 0
+          fi
+          if [[ "${{ inputs.image_tag }}" != "" ]]; then
+            echo "::error::image_tag=$IMAGE_TAG was requested but is not in ECR (expired, or never built)"
+            exit 1
+          fi
+          gunzip -c ticketing-api.tar.gz | docker load
+          docker tag ticketing-api "$REGISTRY/$REPO:$IMAGE_TAG"
+          docker push "$REGISTRY/$REPO:$IMAGE_TAG"
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.17.2
+          terraform_wrapper: false
+
+      - name: terraform init
+        working-directory: ${{ env.TF_DIR }}
+        run: |
+          terraform init -input=false \
+            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
+            -backend-config="key=go-ticketing/${{ vars.ENVIRONMENT || 'sandbox' }}.tfstate" \
+            -backend-config="region=${{ vars.AWS_REGION }}" \
+            -backend-config="encrypt=true" \
+            -backend-config="use_lockfile=true"
+
+      - name: terraform plan
+        id: plan
+        working-directory: ${{ env.TF_DIR }}
+        run: |
+          terraform plan -input=false \
+            -var-file="${{ vars.ENVIRONMENT || 'sandbox' }}.tfvars" \
+            -var="image_tag=$IMAGE_TAG" \
+            -out=tfplan
+          # Human-readable plan with sensitive values redacted: safe to show,
+          # and its digest is what the apply job checks against.
+          terraform show -no-color tfplan > plan.txt
+          echo "digest=$(sha256sum plan.txt | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+          {
+            echo "## Terraform plan — image \`$IMAGE_TAG\`"
+            echo '```'
+            cat plan.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  deploy-apply:
+    name: Deploy · apply (requires approval)
+    runs-on: ubuntu-latest
+    needs: [deploy-plan]
+    # Required reviewers on this environment are the manual approval gate.
+    environment: ${{ vars.ENVIRONMENT || 'sandbox' }}
+    # Deploys to one environment run one at a time and are never cancelled.
+    concurrency:
+      group: deploy-${{ vars.ENVIRONMENT || 'sandbox' }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      TF_IN_AUTOMATION: '1'
+      TF_DIR: infra/envs/go-ticketing
+      IMAGE_TAG: ${{ needs.deploy-plan.outputs.image_tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.17.2
+          terraform_wrapper: false
+
+      - name: terraform init
+        working-directory: ${{ env.TF_DIR }}
+        run: |
+          terraform init -input=false \
+            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
+            -backend-config="key=go-ticketing/${{ vars.ENVIRONMENT || 'sandbox' }}.tfstate" \
+            -backend-config="region=${{ vars.AWS_REGION }}" \
+            -backend-config="encrypt=true" \
+            -backend-config="use_lockfile=true"
+
+      - name: Re-plan and confirm it matches the approved plan
+        working-directory: ${{ env.TF_DIR }}
+        run: |
+          terraform plan -input=false \
+            -var-file="${{ vars.ENVIRONMENT || 'sandbox' }}.tfvars" \
+            -var="image_tag=$IMAGE_TAG" \
+            -out=tfplan
+          terraform show -no-color tfplan > plan.txt
+          actual="$(sha256sum plan.txt | cut -d' ' -f1)"
+          if [[ "$actual" != "${{ needs.deploy-plan.outputs.plan_digest }}" ]]; then
+            echo "::error::The plan changed between review and apply (someone else applied, or infra drifted). Nothing was applied. Re-run the workflow and review the new plan."
+            exit 1
+          fi
+
+      # ---- To keep plans running but stop applies, comment out from here ----
+      - name: terraform apply
+        working-directory: ${{ env.TF_DIR }}
+        run: terraform apply -input=false tfplan
+
+      - name: Verify the new revision rolled out
+        working-directory: ${{ env.TF_DIR }}
+        run: |
+          # Fails if the circuit breaker or the 5xx alarm rolled the deployment
+          # back, if it does not finish in 15 minutes, or if /healthz or /readyz
+          # does not answer through the load balancer afterwards.
+          ../../scripts/verify-deploy.sh \
+            --cluster "$(terraform output -raw cluster_name)" \
+            --service "$(terraform output -raw service_name)" \
+            --task-definition "$(terraform output -raw task_definition_arn)" \
+            --url "$(terraform output -raw url)"
+      # ---- to here ----------------------------------------------------------
