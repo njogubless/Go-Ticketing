@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+# A stand-in for the AWS CLI, for testing rollback.sh and verify-deploy.sh
+# without an AWS account.
+#
+# It records every invocation to $FAKE_AWS_CALLS and answers from files in
+# $FAKE_AWS_DIR (a per-test scenario directory):
+#
+#   describe-services.N.json   N-th describe-services response (1, 2, ...);
+#                              the highest N repeats once the sequence runs out,
+#                              which models a deployment progressing over time.
+#   list-task-definitions.json
+#   task-def-<revision>.json   describe-task-definition for that revision
+#   missing-images             one tag per line that ECR should report missing
+#
+# Mutating calls (update-service) succeed and are only recorded; the tests
+# assert on the recorded arguments.
+set -euo pipefail
+
+printf '%s\n' "$*" >>"$FAKE_AWS_CALLS"
+dir="$FAKE_AWS_DIR"
+
+arg_after() { # value following flag $1 in the remaining args
+  local flag="$1"; shift
+  while [[ $# -gt 0 ]]; do
+    if [[ "$1" == "$flag" ]]; then echo "$2"; return; fi
+    shift
+  done
+}
+
+case "$1 $2" in
+  "ecs describe-services")
+    counter="$dir/.describe-services.count"
+    n=$(( $(cat "$counter" 2>/dev/null || echo 0) + 1 ))
+    echo "$n" >"$counter"
+    while [[ $n -gt 1 && ! -f "$dir/describe-services.$n.json" ]]; do n=$((n - 1)); done
+    cat "$dir/describe-services.$n.json"
+    ;;
+  "ecs list-task-definitions")
+    cat "$dir/list-task-definitions.json"
+    ;;
+  "ecs describe-task-definition")
+    td="$(arg_after --task-definition "$@")"
+    cat "$dir/task-def-${td##*:}.json"
+    ;;
+  "ecr describe-images")
+    ids="$(arg_after --image-ids "$@")"
+    tag="${ids#imageTag=}"
+    if [[ -f "$dir/missing-images" ]] && grep -qx "$tag" "$dir/missing-images"; then
+      echo "An error occurred (ImageNotFoundException): image $tag not found" >&2
+      exit 254
+    fi
+    echo '{"imageDetails":[{"imageTags":["'"$tag"'"]}]}'
+    ;;
+  "ecs update-service")
+    echo '{"service":{}}'
+    ;;
+  *)
+    echo "fake-aws: unhandled command: $*" >&2
+    exit 99
+    ;;
+esac
