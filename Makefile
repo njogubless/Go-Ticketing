@@ -87,6 +87,41 @@ build: ## Build both applications
 .PHONY: check
 check: lint test build ## Everything CI runs, locally
 
+# --- infrastructure ----------------------------------------------------------
+#
+# Everything above runs the app; everything here manages where it runs. The
+# infra-* targets need no AWS credentials. rollback and revisions need real
+# credentials for the target account (AWS_PROFILE or the usual env vars).
+
+TERRAFORM ?= terraform
+INFRA_ENV ?= go-ticketing
+ENVIRONMENT ?= sandbox
+# The module names the ECS cluster, service and task family identically.
+SERVICE_NAME ?= $(INFRA_ENV)-$(ENVIRONMENT)
+
+.PHONY: infra-fmt
+infra-fmt: ## Format all Terraform under infra/
+	$(TERRAFORM) fmt -recursive infra
+
+.PHONY: infra-plan
+infra-plan: ## fmt-check + validate + plan with example.tfvars, no AWS credentials needed
+	TERRAFORM=$(TERRAFORM) infra/scripts/plan-offline.sh infra/envs/$(INFRA_ENV) example.tfvars
+
+.PHONY: infra-test
+infra-test: ## Test the rollback and deploy-verification scripts against a fake AWS CLI
+	infra/scripts/test/run.sh
+
+.PHONY: infra-check
+infra-check: infra-plan infra-test ## Everything the CI infra job runs, locally
+
+.PHONY: revisions
+revisions: ## List deployable task-definition revisions (needs AWS credentials)
+	infra/scripts/rollback.sh --name $(SERVICE_NAME) --list
+
+.PHONY: rollback
+rollback: ## Roll the service back one revision, or to REVISION=N (needs AWS credentials)
+	infra/scripts/rollback.sh --name $(SERVICE_NAME) $(if $(REVISION),--to-revision $(REVISION)) $(if $(URL),--url $(URL))
+
 # --- utilities ---------------------------------------------------------------
 
 .PHONY: psql
