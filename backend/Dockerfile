@@ -6,7 +6,11 @@
 # code execution cannot easily pivot from, and the attack surface of the base
 # image is the part of a deployment nobody remembers to patch.
 
-FROM golang:1.24-alpine AS build
+# Must satisfy the `go` directive in go.mod. The official images set
+# GOTOOLCHAIN=local, so a mismatch is a hard build failure here rather than a
+# silent toolchain download — which is how CI's Go job kept passing while this
+# image could not build.
+FROM golang:1.25-alpine AS build
 
 WORKDIR /src
 
