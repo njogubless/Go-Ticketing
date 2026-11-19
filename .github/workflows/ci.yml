@@ -59,9 +59,9 @@ jobs:
       ENV: test
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
           # go.mod is the single source of truth for the Go version. A
           # hard-coded version here once drifted below go.mod's and kept
@@ -110,9 +110,9 @@ jobs:
     name: Frontend
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: '22'
           cache: npm
@@ -137,7 +137,7 @@ jobs:
     # several minutes per run and tells nobody anything.
     needs: [backend, frontend]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Build the API image
         run: docker build -t ticketing-api ./backend
       - name: Build the web image
@@ -149,7 +149,7 @@ jobs:
       - name: Save the API image for deployment
         if: github.event_name == 'workflow_dispatch' && inputs.deploy && inputs.image_tag == ''
         run: docker save ticketing-api | gzip > ticketing-api.tar.gz
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: github.event_name == 'workflow_dispatch' && inputs.deploy && inputs.image_tag == ''
         with:
           name: ticketing-api-image
@@ -169,8 +169,8 @@ jobs:
     outputs:
       infra: ${{ steps.filter.outputs.infra }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: dorny/paths-filter@v3.0.2
+      - uses: actions/checkout@v7
+      - uses: dorny/paths-filter@v4.0.3
         id: filter
         with:
           filters: |
@@ -184,9 +184,9 @@ jobs:
     needs: [changes]
     if: needs.changes.outputs.infra == 'true'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: hashicorp/setup-terraform@v3
+      - uses: hashicorp/setup-terraform@v4
         with:
           terraform_version: 1.17.2
           # The wrapper rewrites stdout, which breaks `terraform show -json`
@@ -245,9 +245,9 @@ jobs:
       image_tag: ${{ env.IMAGE_TAG }}
       plan_digest: ${{ steps.plan.outputs.digest }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: aws-actions/configure-aws-credentials@v4
+      - uses: aws-actions/configure-aws-credentials@v6
         with:
           role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
           aws-region: ${{ vars.AWS_REGION }}
@@ -255,7 +255,7 @@ jobs:
       - uses: aws-actions/amazon-ecr-login@v2
         id: ecr
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         if: inputs.image_tag == ''
         with:
           name: ticketing-api-image
@@ -280,7 +280,7 @@ jobs:
           docker tag ticketing-api "$REGISTRY/$REPO:$IMAGE_TAG"
           docker push "$REGISTRY/$REPO:$IMAGE_TAG"
 
-      - uses: hashicorp/setup-terraform@v3
+      - uses: hashicorp/setup-terraform@v4
         with:
           terraform_version: 1.17.2
           terraform_wrapper: false
@@ -332,14 +332,14 @@ jobs:
       TF_DIR: infra/envs/go-ticketing
       IMAGE_TAG: ${{ needs.deploy-plan.outputs.image_tag }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: aws-actions/configure-aws-credentials@v4
+      - uses: aws-actions/configure-aws-credentials@v6
         with:
           role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
           aws-region: ${{ vars.AWS_REGION }}
 
-      - uses: hashicorp/setup-terraform@v3
+      - uses: hashicorp/setup-terraform@v4
         with:
           terraform_version: 1.17.2
           terraform_wrapper: false
